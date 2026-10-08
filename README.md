@@ -300,6 +300,14 @@ Config::new().ssr(
 
 On first visits the page is rendered by the SSR server, and the client hydrates it. If the server is down or rendering fails, the page is rendered on the client instead. A slow SSR server can still delay the response until its timeout. Implement `ssr::Gateway` to render pages another way.
 
+`disable_when` skips SSR per request, and `client` takes a `reqwest::Client` for headers, proxies or timeouts, health checks included. Failures are logged, and `on_failure` also receives them as an `SsrFailure` with the SSR server's error, type, hint, browser API, stack and source location, like Laravel's `SsrRenderFailed` event:
+
+```rust
+HttpGateway::new()
+    .disable_when(|request| request.path().starts_with("/admin"))
+    .on_failure(|failure, page| report(&page.component, &failure.error, failure.kind));
+```
+
 ## Testing
 
 `AssertablePage` reads a page from a response body (an HTML document or JSON), with assertions modeled on Laravel's `assertInertia`:
@@ -395,6 +403,8 @@ Implement the `Session` trait (`get`, `put`, `pull`) for the framework's session
 | `Inertia::location($url)` | `inertia.location(url)` |
 | `Inertia::clearHistory()` / `encryptHistory()` | `inertia.clear_history()` / `.encrypt_history(true)` |
 | `$response->assertInertia(fn ($page) => ..)` | `AssertablePage::from_body(&body)..` |
+| `Inertia::disableSsr(fn () => ..)` | `HttpGateway::disable_when(\|request\| ..)` |
+| `Event::listen(SsrRenderFailed::class, ..)` | `HttpGateway::on_failure(\|failure, page\| ..)` |
 
 Not ported yet: Inertia DevTools, `ProvidesInertiaProperties`, component name transformers, the `ensure_pages_exist` check, and Precognition.
 

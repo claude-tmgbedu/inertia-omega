@@ -1,12 +1,14 @@
 //! Server-side rendering.
 
+#[cfg(feature = "ssr")]
+use std::fmt;
 use std::future::Future;
 #[cfg(feature = "ssr")]
 use std::path::PathBuf;
 #[cfg(feature = "ssr")]
-use std::sync::OnceLock;
-#[cfg(feature = "ssr")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "ssr")]
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "ssr")]
 use std::time::Duration;
 
@@ -53,7 +55,7 @@ impl<G: Gateway> DynGateway for G {
 /// Otherwise they're sent to the production SSR server's `/render` endpoint,
 /// started with `node bootstrap/ssr/app.js`.
 #[cfg(feature = "ssr")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpGateway {
     url: String,
     hot_file: Option<PathBuf>,
@@ -61,7 +63,32 @@ pub struct HttpGateway {
     watch: bool,
     except: Vec<String>,
     enabled: bool,
+    disable_when: Option<DisableWhen>,
+    on_failure: Option<OnFailure>,
     client: reqwest::Client,
+}
+
+#[cfg(feature = "ssr")]
+type DisableWhen = Arc<dyn Fn(&Request) -> bool + Send + Sync>;
+
+#[cfg(feature = "ssr")]
+type OnFailure = Arc<dyn Fn(&SsrFailure, &Page) + Send + Sync>;
+
+#[cfg(feature = "ssr")]
+impl fmt::Debug for HttpGateway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpGateway")
+            .field("url", &self.url)
+            .field("hot_file", &self.hot_file)
+            .field("bundle", &self.bundle)
+            .field("watch", &self.watch)
+            .field("except", &self.except)
+            .field("enabled", &self.enabled)
+            .field("disable_when", &self.disable_when.is_some())
+            .field("on_failure", &self.on_failure.is_some())
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 #[cfg(feature = "ssr")]
@@ -82,6 +109,8 @@ impl HttpGateway {
             watch: true,
             except: Vec::new(),
             enabled: true,
+            disable_when: None,
+            on_failure: None,
             client: default_client(),
         }
     }
@@ -131,9 +160,37 @@ impl HttpGateway {
         self
     }
 
+    /// Don't server-side render the requests this returns `true` for.
+    ///
+    /// It's called on every render that [`enabled`](Self::enabled) allows.
+    pub fn disable_when(mut self, condition: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Self {
+        self.disable_when = Some(Arc::new(condition));
+        self
+    }
+
     /// Set the request timeout.
+    ///
+    /// This builds a new client, replacing one set with [`client`](Self::client).
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.client = client(timeout);
+        self
+    }
+
+    /// Send requests to the SSR server, health checks included, with this
+    /// client, to set headers, a proxy or a timeout.
+    ///
+    /// Only the client's own timeout applies, so give it one: without it, a
+    /// hung SSR server holds up the response indefinitely.
+    pub fn client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Call this when rendering fails, before falling back to client-side
+    /// rendering. It's for reporting, like Laravel's `SsrRenderFailed` event:
+    /// failures are logged either way.
+    pub fn on_failure(mut self, callback: impl Fn(&SsrFailure, &Page) + Send + Sync + 'static) -> Self {
+        self.on_failure = Some(Arc::new(callback));
         self
     }
 
@@ -148,7 +205,10 @@ impl HttpGateway {
 
     /// The URL to render with, or `None` when SSR is unavailable.
     fn endpoint(&self, request: &Request) -> Option<String> {
-        if !self.enabled || self.is_excluded(request.path()) {
+        if !self.enabled
+            || self.disable_when.as_ref().is_some_and(|disabled| disabled(request))
+            || self.is_excluded(request.path())
+        {
             return None;
         }
 
@@ -179,6 +239,12 @@ impl HttpGateway {
             }
         })
     }
+
+    fn report(&self, failure: &SsrFailure, page: &Page) {
+        if let Some(on_failure) = &self.on_failure {
+            on_failure(failure, page);
+        }
+    }
 }
 
 #[cfg(feature = "ssr")]
@@ -204,14 +270,25 @@ impl Gateway for HttpGateway {
                 } else {
                     tracing::debug!(%url, %error, "the Inertia SSR server is unreachable");
                 }
+                self.report(&SsrFailure::new(error.to_string(), SsrErrorType::Connection), page);
                 return None;
             }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await.unwrap_or_default();
-            tracing::error!(%url, %status, %error, "Inertia SSR failed; rendering on the client");
+            let failure = SsrFailure::from_body(&response.text().await.unwrap_or_default());
+            tracing::error!(
+                %url,
+                %status,
+                component = %page.component,
+                error = %failure.error,
+                kind = %failure.kind,
+                hint = failure.hint.as_deref(),
+                source_location = failure.source_location.as_deref(),
+                "Inertia SSR failed; rendering on the client"
+            );
+            self.report(&failure, page);
             return None;
         }
 
@@ -226,6 +303,127 @@ impl Gateway for HttpGateway {
                 None
             }
         }
+    }
+}
+
+/// Why the SSR server failed to render a page, as reported to
+/// [`HttpGateway::on_failure`].
+#[cfg(feature = "ssr")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsrFailure {
+    /// The error message.
+    pub error: String,
+    /// What kind of error it was.
+    pub kind: SsrErrorType,
+    /// How to fix the error.
+    pub hint: Option<String>,
+    /// The browser API that was accessed, for [`SsrErrorType::BrowserApi`].
+    pub browser_api: Option<String>,
+    /// The stack trace.
+    pub stack: Option<String>,
+    /// Where the error occurred, as `file:line:column`.
+    pub source_location: Option<String>,
+}
+
+#[cfg(feature = "ssr")]
+impl SsrFailure {
+    fn new(error: impl Into<String>, kind: SsrErrorType) -> Self {
+        Self {
+            error: error.into(),
+            kind,
+            hint: None,
+            browser_api: None,
+            stack: None,
+            source_location: None,
+        }
+    }
+
+    /// Parse the SSR server's error response.
+    fn from_body(body: &str) -> Self {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body {
+            error: Option<String>,
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            hint: Option<String>,
+            browser_api: Option<String>,
+            stack: Option<String>,
+            source_location: Option<String>,
+        }
+
+        let Ok(parsed) = serde_json::from_str::<Body>(body) else {
+            // A proxy in front of the SSR server may answer in plain text.
+            let text = body.trim();
+            return Self::new(
+                if text.is_empty() { UNKNOWN_ERROR } else { text },
+                SsrErrorType::Unknown,
+            );
+        };
+
+        Self {
+            error: parsed.error.unwrap_or_else(|| UNKNOWN_ERROR.to_owned()),
+            kind: parsed
+                .kind
+                .as_deref()
+                .map_or(SsrErrorType::Unknown, SsrErrorType::parse),
+            hint: parsed.hint,
+            browser_api: parsed.browser_api,
+            stack: parsed.stack,
+            source_location: parsed.source_location,
+        }
+    }
+}
+
+#[cfg(feature = "ssr")]
+const UNKNOWN_ERROR: &str = "Unknown SSR error";
+
+/// The kind of an [`SsrFailure`].
+#[cfg(feature = "ssr")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsrErrorType {
+    /// A browser API, such as `window`, was used on the server.
+    BrowserApi,
+    /// The page component couldn't be found.
+    ComponentResolution,
+    /// The component threw while rendering.
+    Render,
+    /// The SSR server couldn't be reached.
+    Connection,
+    /// Any other error.
+    Unknown,
+}
+
+#[cfg(feature = "ssr")]
+impl SsrErrorType {
+    /// The type named in an SSR server's response, such as `browser-api`, or
+    /// [`Unknown`](Self::Unknown) for a name it doesn't recognize.
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "browser-api" => Self::BrowserApi,
+            "component-resolution" => Self::ComponentResolution,
+            "render" => Self::Render,
+            "connection" => Self::Connection,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The type's name in an SSR server's response.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BrowserApi => "browser-api",
+            Self::ComponentResolution => "component-resolution",
+            Self::Render => "render",
+            Self::Connection => "connection",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[cfg(feature = "ssr")]
+impl fmt::Display for SsrErrorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -247,4 +445,61 @@ fn client(timeout: Duration) -> reqwest::Client {
         .timeout(timeout)
         .build()
         .expect("the SSR HTTP client should build")
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_ssr_server_error() {
+        let failure = SsrFailure::from_body(
+            r#"{
+                "error": "window is not defined",
+                "type": "browser-api",
+                "hint": "Move it into onMounted",
+                "browserApi": "window",
+                "stack": "at Home",
+                "sourceLocation": "Home.vue:3:7"
+            }"#,
+        );
+
+        assert_eq!(
+            failure,
+            SsrFailure {
+                error: "window is not defined".to_owned(),
+                kind: SsrErrorType::BrowserApi,
+                hint: Some("Move it into onMounted".to_owned()),
+                browser_api: Some("window".to_owned()),
+                stack: Some("at Home".to_owned()),
+                source_location: Some("Home.vue:3:7".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn unrecognized_errors_are_unknown() {
+        let unknown = SsrFailure::new(UNKNOWN_ERROR, SsrErrorType::Unknown);
+
+        assert_eq!(SsrFailure::from_body(r#"{"type": "nope"}"#), unknown);
+        assert_eq!(SsrFailure::from_body(r#"{"type": null}"#), unknown);
+        assert_eq!(SsrFailure::from_body(""), unknown);
+        assert_eq!(
+            SsrFailure::from_body("Bad Gateway\n"),
+            SsrFailure::new("Bad Gateway", SsrErrorType::Unknown)
+        );
+    }
+
+    #[test]
+    fn error_types_round_trip_their_names() {
+        for kind in [
+            SsrErrorType::BrowserApi,
+            SsrErrorType::ComponentResolution,
+            SsrErrorType::Render,
+            SsrErrorType::Connection,
+            SsrErrorType::Unknown,
+        ] {
+            assert_eq!(SsrErrorType::parse(kind.as_str()), kind);
+        }
+    }
 }
