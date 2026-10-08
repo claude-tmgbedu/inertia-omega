@@ -117,6 +117,18 @@ async fn not_found(inertia: Inertia) -> impl IntoResponse {
 }
 ```
 
+Component names can be transformed before they're rendered, and checked against the page files so a typo fails on the server instead of in the browser:
+
+```rust
+Config::new()
+    .transform_component_using(|name| format!("{name}/Page"))  // "Users/Index" renders "Users/Index/Page"
+    .ensure_pages_exist(true)                                   // off by default
+    .page_paths(["resources/js/pages"])                         // the defaults
+    .page_extensions(["js", "jsx", "svelte", "ts", "tsx", "vue"])
+```
+
+A render of a missing page fails like a failing prop, with `inertia::ComponentNotFound` as the error's source.
+
 ## Props
 
 Any `Serialize` value is a prop. Keys may use dot notation to build nested props, and props can be nested with `props!` as well:
@@ -395,8 +407,10 @@ Implement the `Session` trait (`get`, `put`, `pull`) for the framework's session
 | `Inertia::location($url)` | `inertia.location(url)` |
 | `Inertia::clearHistory()` / `encryptHistory()` | `inertia.clear_history()` / `.encrypt_history(true)` |
 | `$response->assertInertia(fn ($page) => ..)` | `AssertablePage::from_body(&body)..` |
+| `Inertia::transformComponentUsing(fn ($name) => ..)` | `Config::transform_component_using(\|name\| ..)` |
+| `inertia.pages.ensure_pages_exist` / `paths` / `extensions` | `Config::ensure_pages_exist` / `page_paths` / `page_extensions` |
 
-Not ported yet: Inertia DevTools, `ProvidesInertiaProperties`, component name transformers, the `ensure_pages_exist` check, and Precognition.
+Not ported yet: Inertia DevTools, `ProvidesInertiaProperties`, and Precognition.
 
 ## Acknowledgements
 

@@ -1,8 +1,10 @@
 //! Application-wide Inertia configuration.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::pages::Pages;
 use crate::props::Props;
 use crate::request::Request;
 use crate::ssr::{DynGateway, Gateway};
@@ -10,6 +12,7 @@ use crate::view::{RootView, View, default_root_view};
 
 type Share = dyn Fn(&Request) -> Props + Send + Sync;
 type ResolveUrl = dyn Fn(&Request) -> String + Send + Sync;
+type TransformComponent = dyn Fn(&str) -> String + Send + Sync;
 
 /// How Inertia renders pages for an application.
 ///
@@ -30,6 +33,8 @@ pub struct Config {
     pub(crate) root_id: String,
     pub(crate) shares: Vec<Arc<Share>>,
     pub(crate) url_resolver: Option<Arc<ResolveUrl>>,
+    pub(crate) component_transformer: Option<Arc<TransformComponent>>,
+    pub(crate) pages: Pages,
     pub(crate) gateway: Option<Arc<dyn DynGateway>>,
     pub(crate) encrypt_history: bool,
     pub(crate) expose_shared_prop_keys: bool,
@@ -52,6 +57,8 @@ impl Config {
             root_id: "app".to_owned(),
             shares: Vec::new(),
             url_resolver: None,
+            component_transformer: None,
+            pages: Pages::default(),
             gateway: None,
             encrypt_history: false,
             expose_shared_prop_keys: true,
@@ -114,6 +121,49 @@ impl Config {
         self
     }
 
+    /// Transform component names before they're rendered, such as to map
+    /// `Users/Index` to `Users/Index/Page`.
+    pub fn transform_component_using(mut self, transform: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.component_transformer = Some(Arc::new(transform));
+        self
+    }
+
+    pub(crate) fn transform_component(&self, component: String) -> String {
+        match &self.component_transformer {
+            Some(transform) => transform(&component),
+            None => component,
+        }
+    }
+
+    /// Fail renders of page components that have no file in the
+    /// [page paths](Self::page_paths), so a typo is caught on the server
+    /// rather than in the browser. Off by default.
+    pub fn ensure_pages_exist(mut self, ensure: bool) -> Self {
+        self.pages.ensure_exist = ensure;
+        self
+    }
+
+    /// Set the directories page components live in (`resources/js/pages` by default).
+    pub fn page_paths<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.pages.paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the file extensions of page components (`js`, `jsx`, `svelte`,
+    /// `ts`, `tsx` and `vue` by default).
+    pub fn page_extensions<I, E>(mut self, extensions: I) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<String>,
+    {
+        self.pages.extensions = extensions.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Render first visits on the server through the given [`Gateway`].
     pub fn ssr(mut self, gateway: impl Gateway) -> Self {
         self.gateway = Some(Arc::new(gateway));
@@ -157,6 +207,8 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("version", &self.current_version())
             .field("root_id", &self.root_id)
+            .field("transform_component", &self.component_transformer.is_some())
+            .field("pages", &self.pages)
             .field("ssr", &self.gateway.is_some())
             .field("encrypt_history", &self.encrypt_history)
             .field("expose_shared_prop_keys", &self.expose_shared_prop_keys)

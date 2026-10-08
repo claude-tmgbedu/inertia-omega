@@ -570,3 +570,83 @@ async fn pages_carry_their_headers_as_json_and_as_documents() {
     assert_eq!(document.headers()["x-page"], "users");
     assert_eq!(document.headers()["cache-control"], "no-store");
 }
+
+fn page_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("inertia-core-pages-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("Users/Index")).unwrap();
+    std::fs::write(dir.join("Users/Index/Page.tsx"), "").unwrap();
+    dir
+}
+
+fn inertia_visit_with(config: Config) -> Inertia {
+    Inertia::new(
+        config,
+        request(Method::GET, &[("x-inertia", "true"), ("x-inertia-version", "1")]),
+    )
+}
+
+#[tokio::test]
+async fn component_names_are_transformed_before_rendering() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = config().transform_component_using({
+        let seen = Arc::clone(&seen);
+        move |name| {
+            seen.lock().unwrap().push(name.to_owned());
+            format!("{name}/Page")
+        }
+    });
+
+    let page = resolve(inertia_visit_with(config).render("Users/Index", props! {})).await;
+
+    assert_eq!(page.component, "Users/Index/Page");
+    assert_eq!(*seen.lock().unwrap(), ["Users/Index"]);
+}
+
+#[tokio::test]
+async fn missing_pages_fail_the_render_when_ensured() {
+    let config = config().ensure_pages_exist(true).page_paths([page_dir("missing")]);
+
+    let error = inertia_visit_with(config)
+        .render("Users/Show", props! {})
+        .into_page()
+        .await
+        .unwrap_err()
+        .into_inner();
+
+    let missing = error.downcast_ref::<inertia::ComponentNotFound>().unwrap();
+    assert_eq!(missing.component, "Users/Show");
+    assert_eq!(error.to_string(), "Inertia page component [Users/Show] not found.");
+}
+
+#[tokio::test]
+async fn existing_pages_render_when_ensured() {
+    let config = config()
+        .ensure_pages_exist(true)
+        .page_paths([page_dir("existing")])
+        .page_extensions(["tsx"]);
+
+    let page = resolve(inertia_visit_with(config).render("Users/Index/Page", props! {})).await;
+
+    assert_eq!(page.component, "Users/Index/Page");
+}
+
+#[tokio::test]
+async fn the_transformed_name_is_checked_for_existence() {
+    let config = config()
+        .transform_component_using(|name| format!("{name}/Page"))
+        .ensure_pages_exist(true)
+        .page_paths([page_dir("transformed")]);
+
+    let page = resolve(inertia_visit_with(config).render("Users/Index", props! {})).await;
+
+    assert_eq!(page.component, "Users/Index/Page");
+}
+
+#[tokio::test]
+async fn missing_pages_render_unless_ensured() {
+    let config = config().page_paths([page_dir("unchecked")]);
+
+    let page = resolve(inertia_visit_with(config).render("Nowhere", props! {})).await;
+
+    assert_eq!(page.component, "Nowhere");
+}

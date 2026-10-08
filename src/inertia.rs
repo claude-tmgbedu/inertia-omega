@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use crate::HttpResponse;
 use crate::config::Config;
 use crate::errors::{ErrorBags, ValidationErrors};
-use crate::props::{IntoProp, IntoProps, Props};
+use crate::props::{IntoProp, IntoProps, PropError, Props};
 use crate::protocol;
 use crate::request::Request;
 use crate::response::Response;
@@ -91,8 +91,18 @@ impl Inertia {
     ///
     /// `props` may be [`Props`], usually built with [`props!`](crate::props!),
     /// or any `Serialize` type that serializes to an object, such as a struct.
+    ///
+    /// The component name goes through [`Config::transform_component_using`],
+    /// and with [`Config::ensure_pages_exist`] a missing page fails the render
+    /// with [`ComponentNotFound`](crate::ComponentNotFound).
     pub fn render(&self, component: impl Into<String>, props: impl IntoProps) -> Response {
-        Response::new(self.clone(), component.into(), props.into_props())
+        let component = self.config().transform_component(component.into());
+        let props = match self.config().pages.ensure(&component) {
+            Ok(()) => props.into_props(),
+            Err(missing) => Err(PropError::new(missing)),
+        };
+
+        Response::new(self.clone(), component, props)
     }
 
     /// Share a prop with this request's page.
