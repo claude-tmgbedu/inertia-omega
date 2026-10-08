@@ -13,7 +13,7 @@
 //! ```
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::page::Page;
 
@@ -47,18 +47,12 @@ impl AssertablePage {
 
     /// The prop at the given dot-notation path, such as `users.0.name`.
     pub fn prop(&self, path: &str) -> Option<&Value> {
-        let mut segments = path.split('.');
-        let mut value = self.page.props.get(segments.next()?)?;
+        lookup(&self.page.props, path)
+    }
 
-        for segment in segments {
-            value = match value {
-                Value::Object(object) => object.get(segment)?,
-                Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
-                _ => return None,
-            };
-        }
-
-        Some(value)
+    /// The flash data at the given dot-notation path, such as `toast.message`.
+    pub fn flash_value(&self, path: &str) -> Option<&Value> {
+        lookup(&self.page.flash, path)
     }
 
     /// Assert the page component.
@@ -145,15 +139,36 @@ impl AssertablePage {
         self
     }
 
-    /// Assert the page's flash data.
+    /// Assert that the flash data at the given dot-notation path equals the given value.
     #[track_caller]
-    pub fn flash(&self, key: &str, expected: impl Serialize) -> &Self {
+    pub fn flash(&self, path: &str, expected: impl Serialize) -> &Self {
         let expected = serde_json::to_value(expected).expect("the expected value should serialize");
 
-        assert_eq!(
-            self.page.flash.get(key),
-            Some(&expected),
-            "unexpected Inertia flash data [{key}]"
+        match self.flash_value(path) {
+            Some(actual) => assert_eq!(actual, &expected, "unexpected Inertia flash data [{path}]"),
+            None => panic!("expected the Inertia flash data to have [{path}]\n\n{}", self.flashed()),
+        }
+        self
+    }
+
+    /// Assert that the flash data has the given path, whatever its value.
+    #[track_caller]
+    pub fn has_flash(&self, path: &str) -> &Self {
+        assert!(
+            self.flash_value(path).is_some(),
+            "expected the Inertia flash data to have [{path}]\n\n{}",
+            self.flashed()
+        );
+        self
+    }
+
+    /// Assert that the flash data doesn't have the given path.
+    #[track_caller]
+    pub fn missing_flash(&self, path: &str) -> &Self {
+        assert!(
+            self.flash_value(path).is_none(),
+            "expected the Inertia flash data not to have [{path}]\n\n{}",
+            self.flashed()
         );
         self
     }
@@ -161,6 +176,26 @@ impl AssertablePage {
     fn props(&self) -> String {
         serde_json::to_string_pretty(&self.page.props).unwrap_or_default()
     }
+
+    fn flashed(&self) -> String {
+        serde_json::to_string_pretty(&self.page.flash).unwrap_or_default()
+    }
+}
+
+/// The value at a dot-notation path, where numeric segments index arrays.
+fn lookup<'a>(map: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segments = path.split('.');
+    let mut value = map.get(segments.next()?)?;
+
+    for segment in segments {
+        value = match value {
+            Value::Object(object) => object.get(segment)?,
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+
+    Some(value)
 }
 
 /// The contents of the page data `<script>` of an HTML document.
@@ -197,5 +232,36 @@ mod tests {
     #[should_panic(expected = "unexpected Inertia page component")]
     fn fails_on_the_wrong_component() {
         AssertablePage::from_body(HTML).component("Dashboard");
+    }
+
+    const FLASHED: &str = r#"{"component":"Home","props":{},"url":"/","version":"1","flash":{"toast":{"message":"Saved!","level":"success"},"empty":null}}"#;
+
+    #[test]
+    fn asserts_flash_data_by_path() {
+        AssertablePage::from_body(FLASHED)
+            .flash("toast.message", "Saved!")
+            .flash("toast", serde_json::json!({ "message": "Saved!", "level": "success" }))
+            .has_flash("toast.level")
+            .has_flash("empty")
+            .missing_flash("toast.icon")
+            .missing_flash("error");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the Inertia flash data to have [error]")]
+    fn fails_on_missing_flash_data() {
+        AssertablePage::from_body(FLASHED).has_flash("error");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the Inertia flash data not to have [toast]")]
+    fn fails_on_unexpected_flash_data() {
+        AssertablePage::from_body(FLASHED).missing_flash("toast");
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected Inertia flash data [toast.level]")]
+    fn fails_on_the_wrong_flash_value() {
+        AssertablePage::from_body(FLASHED).flash("toast.level", "error");
     }
 }

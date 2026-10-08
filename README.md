@@ -313,8 +313,11 @@ AssertablePage::from_body(&body)
     .equals("users.0.name", "Taylor")
     .missing("users.0.password")
     .deferred("default", &["stats"])
-    .flash("toast", "Saved!");
+    .flash("toast", "Saved!")
+    .missing_flash("error");
 ```
+
+Flash data is asserted by dot-notation path like props: `flash` checks a value, `has_flash` and `missing_flash` its presence.
 
 The core can also be tested without a web framework. Build an `Inertia` handle from a `Request` and an `ArraySession`, then resolve a render with `Response::into_page`. See [`tests/core.rs`](tests/core.rs).
 
@@ -395,6 +398,7 @@ Implement the `Session` trait (`get`, `put`, `pull`) for the framework's session
 | `Inertia::location($url)` | `inertia.location(url)` |
 | `Inertia::clearHistory()` / `encryptHistory()` | `inertia.clear_history()` / `.encrypt_history(true)` |
 | `$response->assertInertia(fn ($page) => ..)` | `AssertablePage::from_body(&body)..` |
+| `$page->hasFlash('key')` / `missingFlash('key')` | `.has_flash("key")` / `.missing_flash("key")` |
 
 Not ported yet: Inertia DevTools, `ProvidesInertiaProperties`, component name transformers, the `ensure_pages_exist` check, and Precognition.
 
