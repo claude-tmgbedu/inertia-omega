@@ -2,6 +2,7 @@
 //! controls when and how each prop is sent.
 
 mod prop;
+mod provider;
 mod resolver;
 mod scroll;
 
@@ -14,6 +15,7 @@ use serde_json::Value;
 
 pub(crate) use self::prop::{Computed, Loading, Merge, Once, Source};
 pub use self::prop::{IntoProp, Prop};
+pub use self::provider::{PropertyContext, ProvidesProp, ProvidesProps, RenderContext};
 pub(crate) use self::resolver::PropsResolver;
 pub use self::scroll::{Paginator, ProvidesScrollMetadata, ScrollMetadata};
 
@@ -297,6 +299,39 @@ where
     }));
 
     scrollable(Prop::from_source(source), None)
+}
+
+/// A prop computed from its context: its key, its siblings and the request.
+/// It's only computed when part of the response.
+///
+/// The prop's own behavior (`.deferred()`, `.rescue()`, ...) applies; the
+/// prop the provider returns only supplies the value.
+///
+/// ```
+/// use inertia::PropertyContext;
+///
+/// let title = inertia::contextual(|context: &PropertyContext<'_>| format!("The {} prop", context.key));
+/// ```
+pub fn contextual(provider: impl ProvidesProp + Send + 'static) -> Prop {
+    Prop::from_source(Source::Contextual(Box::new(provider)))
+}
+
+/// Nested props from a [`ProvidesProps`], computed with the page being rendered.
+///
+/// ```
+/// use inertia::{RenderContext, props};
+///
+/// let props = props! {
+///     "auth" => inertia::props_from(|_: &RenderContext<'_>| props! { "user" => "Taylor" }),
+/// };
+/// ```
+pub fn props_from(provider: impl ProvidesProps + Send + 'static) -> Prop {
+    contextual(move |context: &PropertyContext<'_>| {
+        provider.props(&RenderContext {
+            component: context.component,
+            request: context.request,
+        })
+    })
 }
 
 fn scrollable(prop: Prop, metadata: Option<ScrollMetadata>) -> Prop {

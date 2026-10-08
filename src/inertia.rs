@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use crate::HttpResponse;
 use crate::config::Config;
 use crate::errors::{ErrorBags, ValidationErrors};
-use crate::props::{IntoProp, IntoProps, Props};
+use crate::props::{IntoProp, IntoProps, Prop, ProvidesProps};
 use crate::protocol;
 use crate::request::Request;
 use crate::response::Response;
@@ -46,12 +46,19 @@ struct Context {
 /// State queued for the next page render.
 #[derive(Default)]
 pub(crate) struct Pending {
-    pub(crate) shared: Props,
+    pub(crate) shared: Vec<Shared>,
     pub(crate) flash: Map<String, Value>,
     pub(crate) errors: ErrorBags,
     pub(crate) clear_history: bool,
     pub(crate) preserve_fragment: bool,
     pub(crate) encrypt_history: Option<bool>,
+}
+
+/// A prop or provider shared with the next page render, in order, so later
+/// shares take precedence.
+pub(crate) enum Shared {
+    Prop(String, Box<Prop>),
+    Provider(Box<dyn ProvidesProps + Send>),
 }
 
 impl Inertia {
@@ -100,7 +107,14 @@ impl Inertia {
         let key = key.into();
         // Prop conversion may serialize application code that shares more data.
         let value = value.into_prop();
-        self.pending().shared.insert(key, value);
+        self.pending().shared.push(Shared::Prop(key, Box::new(value)));
+        self
+    }
+
+    /// Share the props of a [`ProvidesProps`] with this request's page. It
+    /// runs when the page renders, with the page being rendered.
+    pub fn share_from(&self, provider: impl ProvidesProps + Send + 'static) -> &Self {
+        self.pending().shared.push(Shared::Provider(Box::new(provider)));
         self
     }
 

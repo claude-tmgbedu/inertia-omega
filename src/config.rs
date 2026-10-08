@@ -3,12 +3,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::props::Props;
+use crate::props::{Props, ProvidesProps, RenderContext};
 use crate::request::Request;
 use crate::ssr::{DynGateway, Gateway};
 use crate::view::{RootView, View, default_root_view};
 
-type Share = dyn Fn(&Request) -> Props + Send + Sync;
+type Share = dyn ProvidesProps + Send + Sync;
 type ResolveUrl = dyn Fn(&Request) -> String + Send + Sync;
 
 /// How Inertia renders pages for an application.
@@ -103,8 +103,14 @@ impl Config {
     ///
     /// For per-request data, such as the current user, call
     /// [`Inertia::share`](crate::Inertia::share) from a middleware instead.
-    pub fn share(mut self, share: impl Fn(&Request) -> Props + Send + Sync + 'static) -> Self {
-        self.shares.push(Arc::new(share));
+    pub fn share(self, share: impl Fn(&Request) -> Props + Send + Sync + 'static) -> Self {
+        self.share_from(move |context: &RenderContext<'_>| share(context.request))
+    }
+
+    /// Share the props of a [`ProvidesProps`] with every page. It runs on
+    /// every render, with the page being rendered.
+    pub fn share_from(mut self, provider: impl ProvidesProps + Send + Sync + 'static) -> Self {
+        self.shares.push(Arc::new(provider));
         self
     }
 

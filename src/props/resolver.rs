@@ -7,12 +7,13 @@ use futures_util::future::{BoxFuture, join_all};
 use serde_json::{Map, Value};
 
 use super::prop::Options;
-use super::{Computed, Loading, Merge, Once, Prop, PropError, Props, Source};
+use super::{Computed, Loading, Merge, Once, Prop, PropError, PropertyContext, Props, Source};
 use crate::page::{Metadata, OnceState, ScrollState};
 use crate::request::Request;
 
 pub(crate) struct PropsResolver<'a> {
     request: &'a Request,
+    component: &'a str,
     is_partial: bool,
     metadata: Metadata,
 }
@@ -43,9 +44,10 @@ enum Resolved {
 }
 
 impl<'a> PropsResolver<'a> {
-    pub(crate) fn new(request: &'a Request, component: &str) -> Self {
+    pub(crate) fn new(request: &'a Request, component: &'a str) -> Self {
         Self {
             request,
+            component,
             is_partial: request.is_partial_reload_of(component),
             metadata: Metadata::default(),
         }
@@ -72,6 +74,17 @@ impl<'a> PropsResolver<'a> {
         let mut all = shared;
         all.0.extend(props.0);
 
+        // Context-aware props that dotted keys are set inside are computed
+        // first, so the keys merge into their values.
+        let targets: Vec<String> = all
+            .keys()
+            .filter_map(|key| key.split_once('.'))
+            .map(|(first, _)| first.to_owned())
+            .collect();
+        self.provide(&mut all, "", |options, path| {
+            is_plain(options) && targets.iter().any(|target| target == path)
+        });
+
         let all = unpack_dot_keys(all).await?;
         let resolved = self.resolve_props(all, String::new(), false).await?;
 
@@ -89,15 +102,16 @@ impl<'a> PropsResolver<'a> {
         parent_was_resolved: bool,
     ) -> BoxFuture<'_, Result<Map<String, Value>, PropError>> {
         Box::pin(async move {
+            let mut props = props;
+            self.provide(&mut props, &prefix, |options, path| {
+                self.is_part_of_response(options, path, parent_was_resolved)
+            });
+
             let mut plans = Vec::with_capacity(props.len());
             let mut callbacks = Vec::new();
 
             for (key, Prop { source, mut options }) in props {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
+                let path = join(&prefix, &key);
 
                 // Partial reloads only include the props they ask for. Always
                 // props, and the children of resolved values, are exempt.
@@ -128,6 +142,7 @@ impl<'a> PropsResolver<'a> {
                         callbacks.push(callback());
                         Ok(Resolved::Pending(callbacks.len() - 1))
                     }
+                    Source::Contextual(_) => unreachable!("context-aware props are provided before planning"),
                 };
 
                 plans.push(Plan::Included {
@@ -198,6 +213,52 @@ impl<'a> PropsResolver<'a> {
 
             Ok(resolved)
         })
+    }
+
+    /// Compute the context-aware props that match `should_provide`. They see
+    /// their unresolved siblings, so all are computed before any is replaced.
+    fn provide(&self, props: &mut Props, prefix: &str, should_provide: impl Fn(&Options, &str) -> bool) {
+        let siblings = &*props;
+        let provided: Vec<(usize, Source)> = siblings
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (key, prop))| {
+                let Source::Contextual(provider) = &prop.source else {
+                    return None;
+                };
+                let path = join(prefix, key);
+
+                if !should_provide(&prop.options, &path) {
+                    return None;
+                }
+
+                let context = PropertyContext {
+                    key: &path,
+                    props: siblings,
+                    request: self.request,
+                    component: self.component,
+                };
+                let mut source = provider.prop(&context).source;
+                while let Source::Contextual(provider) = source {
+                    source = provider.prop(&context).source;
+                }
+
+                Some((index, source))
+            })
+            .collect();
+
+        for (index, source) in provided {
+            if let Some((_, prop)) = props.0.get_index_mut(index) {
+                prop.source = source;
+            }
+        }
+    }
+
+    /// Whether a prop is resolved into the response.
+    fn is_part_of_response(&self, options: &Options, path: &str, parent_was_resolved: bool) -> bool {
+        self.is_included_in_partial_reload(options, path, parent_was_resolved)
+            && (self.is_partial || !self.is_excluded_from_full_visit(options, path))
     }
 
     /// Apply partial reload filtering to the children of a literal object.
@@ -363,6 +424,14 @@ impl<'a> PropsResolver<'a> {
     }
 }
 
+fn join(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
 /// Whether `path` is `ancestor` or one of its descendants.
 fn is_within(path: &str, ancestor: &str) -> bool {
     path.strip_prefix(ancestor)
@@ -433,6 +502,8 @@ async fn into_props(source: Source) -> Result<Option<Props>, PropError> {
         Source::Value(value) => value,
         Source::Callback(callback) => callback().await?.value,
         Source::Failed(error) => return Err(error),
+        // Only computed with its context, which nested dotted keys lack.
+        Source::Contextual(_) => return Ok(None),
     };
 
     Ok(match value {

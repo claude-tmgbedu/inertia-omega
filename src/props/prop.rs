@@ -5,7 +5,7 @@ use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{PropError, Props, ScrollMetadata};
+use super::{PropError, Props, ProvidesProp, ScrollMetadata};
 
 /// A single page prop.
 ///
@@ -34,6 +34,8 @@ pub(crate) enum Source {
     Props(Props),
     /// A callback that only runs when the prop is part of the response.
     Callback(Callback),
+    /// A value computed from the prop's context once it's part of the response.
+    Contextual(Box<dyn ProvidesProp + Send>),
     /// A value that failed to serialize.
     Failed(PropError),
 }
@@ -259,6 +261,7 @@ impl fmt::Debug for Source {
             Self::Value(value) => f.debug_tuple("Value").field(value).finish(),
             Self::Props(props) => f.debug_tuple("Props").field(props).finish(),
             Self::Callback(_) => f.write_str("Callback"),
+            Self::Contextual(_) => f.write_str("Contextual"),
             Self::Failed(error) => f.debug_tuple("Failed").field(error).finish(),
         }
     }

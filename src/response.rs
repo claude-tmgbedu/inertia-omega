@@ -9,10 +9,10 @@ use serde_json::{Map, Value};
 use crate::HttpResponse;
 use crate::errors::ErrorBags;
 use crate::header as inertia_header;
-use crate::inertia::Inertia;
+use crate::inertia::{Inertia, Shared};
 use crate::json::{encode_big_integers, html_safe_json};
 use crate::page::Page;
-use crate::props::{self, IntoProp, PropError, Props, PropsResolver};
+use crate::props::{self, IntoProp, PropError, Props, PropsResolver, ProvidesProps, RenderContext};
 use crate::session::{SharedSession, key};
 use crate::ssr::Rendered;
 use crate::view::View;
@@ -66,6 +66,17 @@ impl Response {
     pub fn with(mut self, key: impl Into<String>, value: impl IntoProp) -> Self {
         if let Ok(props) = &mut self.props {
             props.insert(key, value);
+        }
+        self
+    }
+
+    /// Add the props of a [`ProvidesProps`], replacing any props with the same keys.
+    pub fn with_props_from(mut self, provider: impl ProvidesProps) -> Self {
+        if let Ok(props) = &mut self.props {
+            props.extend(provider.props(&RenderContext {
+                component: &self.component,
+                request: self.inertia.request(),
+            }));
         }
         self
     }
@@ -216,10 +227,21 @@ impl Response {
             "errors",
             props::always(errors.to_prop(request.error_bag(), config.with_all_errors)),
         );
+        let context = RenderContext {
+            component: &component,
+            request,
+        };
         for share in &config.shares {
-            shared.extend(share(request));
+            shared.extend(share.props(&context));
         }
-        shared.extend(pending.shared);
+        for share in pending.shared {
+            match share {
+                Shared::Prop(key, value) => {
+                    shared.insert(key, *value);
+                }
+                Shared::Provider(provider) => shared.extend(provider.props(&context)),
+            }
+        }
 
         let (props, metadata) = PropsResolver::new(request, &component)
             .resolve(shared, props, config.expose_shared_prop_keys)

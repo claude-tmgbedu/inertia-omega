@@ -168,6 +168,29 @@ For infinite scroll, `Paginator` paginates a collection and describes its pages;
 }),
 ```
 
+Reusable sets of props can implement `ProvidesProps`, which receives a `RenderContext` with the component being rendered and the request. Add their props with `with_props_from`, or nest them under a key with `inertia::props_from`; closures taking a `RenderContext` work too:
+
+```rust
+struct Breadcrumbs;
+
+impl ProvidesProps for Breadcrumbs {
+    fn props(&self, context: &RenderContext<'_>) -> Props {
+        props! { "breadcrumbs" => context.component.split('/').collect::<Vec<_>>() }
+    }
+}
+
+inertia
+    .render("Users/Edit", props! { "user" => user })
+    .with_props_from(Breadcrumbs)          // replaces earlier props with the same keys
+    .with("title", "Edit user")            // and is replaced by later ones
+```
+
+A single prop can be computed from its `PropertyContext` (its dotted key, its unresolved siblings and the request) with `inertia::contextual`, from a closure or a `ProvidesProp` type. It's only computed when part of the response, and composes like the other props:
+
+```rust
+"title" => inertia::contextual(|context: &PropertyContext<'_>| format!("{} of {}", context.key, context.request.url())).deferred(),
+```
+
 ## Shared data
 
 Share data with every page from the config. The callback runs on each render, so make anything expensive lazy:
@@ -194,6 +217,8 @@ let app = Router::new()
     .layer(middleware::from_fn(share_user))  // inside of the Inertia layer
     .layer(InertiaLayer::new(config));
 ```
+
+`Config::share_from` and `inertia.share_from` share the props of a `ProvidesProps`, which runs when the page renders. Later shares replace earlier ones with the same keys, and page props replace shared props.
 
 Validation errors are shared automatically as `errors`. Shared prop keys are listed in the page's `sharedProps`.
 
@@ -389,6 +414,8 @@ Implement the `Session` trait (`get`, `put`, `pull`) for the framework's session
 | `Inertia::once(fn () => ..)->until(..)` | `inertia::once(\|\| async { .. }).until(..)` |
 | `Inertia::scroll(User::paginate())` | `inertia::scroll(Paginator::from_items(..))` |
 | `HandleInertiaRequests::share()` | `Config::share` or `inertia.share(..)` in a middleware |
+| `ProvidesInertiaProperties` / `RenderContext` | `ProvidesProps` / `RenderContext`: `.with_props_from(..)`, `inertia::props_from(..)`, `share_from(..)` |
+| `ProvidesInertiaProperty` / `PropertyContext` | `ProvidesProp` / `PropertyContext`: `inertia::contextual(..)` |
 | `HandleInertiaRequests::version()` | `Config::version` / `Config::version_with` |
 | `back()->withErrors($errors)` | `inertia.back_with_errors(errors)` |
 | `Inertia::flash('key', $value)` | `inertia.flash("key", value)` |
@@ -396,7 +423,7 @@ Implement the `Session` trait (`get`, `put`, `pull`) for the framework's session
 | `Inertia::clearHistory()` / `encryptHistory()` | `inertia.clear_history()` / `.encrypt_history(true)` |
 | `$response->assertInertia(fn ($page) => ..)` | `AssertablePage::from_body(&body)..` |
 
-Not ported yet: Inertia DevTools, `ProvidesInertiaProperties`, component name transformers, the `ensure_pages_exist` check, and Precognition.
+Not ported yet: Inertia DevTools, component name transformers, the `ensure_pages_exist` check, and Precognition.
 
 ## Acknowledgements
 

@@ -1,12 +1,16 @@
 //! The framework-agnostic core, exercised without a web framework.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, Method};
 use inertia::session::ArraySession;
 use inertia::testing::AssertablePage;
-use inertia::{Config, Inertia, Page, Paginator, Props, Request, ValidationErrors, props};
+use inertia::{
+    Config, Inertia, Page, Paginator, PropertyContext, Props, ProvidesProps, RenderContext, Request, ValidationErrors,
+    props,
+};
 use serde::Serialize;
 use serde_json::json;
 
@@ -569,4 +573,202 @@ async fn pages_carry_their_headers_as_json_and_as_documents() {
         .unwrap();
     assert_eq!(document.headers()["x-page"], "users");
     assert_eq!(document.headers()["cache-control"], "no-store");
+}
+
+/// Provides the given props, like the Laravel adapter's test stub.
+struct Provider(fn() -> Props);
+
+impl ProvidesProps for Provider {
+    fn props(&self, _: &RenderContext<'_>) -> Props {
+        (self.0)()
+    }
+}
+
+#[tokio::test]
+async fn providers_add_props_in_order() {
+    let page = resolve(
+        visit(&[])
+            .render(
+                "Users/Edit",
+                props! { "regular" => "prop", "replaced" => "by the provider" },
+            )
+            .with_props_from(|context: &RenderContext<'_>| {
+                props! {
+                    "component" => context.component,
+                    "url" => context.request.url(),
+                    "replaced" => "provided",
+                }
+            })
+            .with("another", "normal_prop"),
+    )
+    .await;
+
+    assert_eq!(
+        serde_json::to_value(&page.props).unwrap(),
+        json!({
+            "errors": {},
+            "appName": "Demo",
+            "auth": { "check": true },
+            "regular": "prop",
+            "replaced": "provided",
+            "component": "Users/Edit",
+            "url": "/users?page=1",
+            "another": "normal_prop",
+        })
+    );
+}
+
+#[tokio::test]
+async fn providers_can_be_shared() {
+    let config = config().share_from(|context: &RenderContext<'_>| props! { "page" => context.component });
+    let inertia = Inertia::new(config, request(Method::GET, &[("x-inertia", "true")]));
+    inertia.share("regular", "shared_prop");
+    inertia.share_from(Provider(
+        || props! { "from_object" => "shared_value", "regular" => "provided" },
+    ));
+    inertia.share_from(Provider(|| props! { "overridden" => "shared" }));
+    let page = resolve(inertia.render("Users", props! { "overridden" => "page" })).await;
+
+    assert_eq!(
+        serde_json::to_value(&page.props).unwrap(),
+        json!({
+            "errors": {},
+            "appName": "Demo",
+            "auth": { "check": true },
+            "page": "Users",
+            "regular": "provided",
+            "from_object": "shared_value",
+            "overridden": "page",
+        })
+    );
+    assert_eq!(
+        page.metadata.shared_props,
+        [
+            "errors",
+            "appName",
+            "auth",
+            "page",
+            "regular",
+            "from_object",
+            "overridden"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn provided_props_keep_their_behavior() {
+    let provider = || {
+        Provider(|| {
+            props! {
+                "foo" => inertia::defer(|| async { "foo value" }),
+                "bar" => inertia::defer(|| async { "bar value" }).group("custom").merge(),
+                "plans" => inertia::once(|| async { ["basic"] }),
+                "tags" => inertia::merge(["rust"]),
+            }
+        })
+    };
+    let render = |inertia: Inertia| {
+        inertia
+            .render("Users", props! { "user" => "Jonathan" })
+            .with_props_from(provider())
+    };
+
+    let page = resolve(render(visit(&[]))).await;
+    assert_eq!(
+        serde_json::to_value(&page.props).unwrap(),
+        json!({
+            "errors": {},
+            "appName": "Demo",
+            "auth": { "check": true },
+            "user": "Jonathan",
+            "plans": ["basic"],
+            "tags": ["rust"],
+        })
+    );
+    assert_eq!(page.metadata.deferred_props["default"], ["foo"]);
+    assert_eq!(page.metadata.deferred_props["custom"], ["bar"]);
+    assert_eq!(page.metadata.merge_props, ["bar", "tags"]);
+    assert_eq!(page.metadata.once_props["plans"].prop, "plans");
+
+    let page = resolve(render(reload(&[("x-inertia-partial-data", "foo")]))).await;
+    assert_eq!(
+        serde_json::to_value(&page.props).unwrap(),
+        json!({ "errors": {}, "foo": "foo value" })
+    );
+}
+
+#[tokio::test]
+async fn providers_can_be_nested() {
+    let props = || {
+        props! {
+            "auth" => inertia::props_from(|context: &RenderContext<'_>| props! {
+                "user" => "Jonathan",
+                "permissions" => inertia::optional(|| async { ["manage-users"] }),
+                "component" => context.component,
+            }),
+            "auth.team" => "Inertia",
+        }
+    };
+
+    let page = resolve(visit(&[]).render("Users", props())).await;
+    assert_eq!(
+        page.props["auth"],
+        json!({ "user": "Jonathan", "component": "Users", "check": true, "team": "Inertia" })
+    );
+
+    let page = resolve(reload(&[("x-inertia-partial-data", "auth.permissions")]).render("Users", props())).await;
+    assert_eq!(page.props["auth"], json!({ "permissions": ["manage-users"] }));
+}
+
+#[tokio::test]
+async fn contextual_props_see_their_key_siblings_and_request() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let props = || {
+        let counted = Arc::clone(&calls);
+        props! {
+            "items" => ["foo"],
+            "deep.foo.bar" => inertia::contextual(|context: &PropertyContext<'_>| {
+                format!("{} beside {}", context.key, context.props.keys().collect::<Vec<_>>().join(","))
+            }),
+            "url" => inertia::contextual(|context: &PropertyContext<'_>| context.request.url().to_owned()),
+            "skipped" => inertia::contextual(move |_: &PropertyContext<'_>| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                "computed"
+            })
+            .optional(),
+        }
+    };
+
+    let page = resolve(visit(&[]).render("Users", props())).await;
+    assert_eq!(
+        page.props["deep"],
+        json!({ "foo": { "bar": "deep.foo.bar beside bar" } })
+    );
+    assert_eq!(page.props["url"], "/users?page=1");
+    assert!(page.props.get("skipped").is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "excluded props aren't computed");
+
+    let page = resolve(reload(&[("x-inertia-partial-data", "skipped")]).render("Users", props())).await;
+    assert_eq!(page.props["skipped"], "computed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn contextual_props_can_be_deferred_and_rescued() {
+    let props = || {
+        props! {
+            "stats" => inertia::contextual(|_: &PropertyContext<'_>| {
+                inertia::try_lazy(|| async { Err::<u8, _>("Failed to resolve stats") })
+            })
+            .deferred()
+            .rescue(),
+        }
+    };
+
+    let page = resolve(visit(&[]).render("Users", props())).await;
+    assert_eq!(page.metadata.deferred_props["default"], ["stats"]);
+
+    let page = resolve(reload(&[("x-inertia-partial-data", "stats")]).render("Users", props())).await;
+    assert!(page.props.get("stats").is_none());
+    assert_eq!(page.metadata.rescued_props, ["stats"]);
 }
